@@ -35,6 +35,7 @@ def display_peg_line(
     symbol: str,
     data: Optional[pd.DataFrame] = None,
     currency: Optional[str] = None,
+    growth_rate: Optional[str] = None,
     start_date: Optional[str] = None,
     source_earnings: str = "AlphaVantage",
     source_estimates: str = "SeekingAlpha",
@@ -50,8 +51,10 @@ def display_peg_line(
         Stock ticker symbol
     data: pd.DataFrame
         Stock dataframe
-    currency : str
+    currency : Optional[str]
         Optionally specify the currency to return results in.
+    growth_rate : Optional[str]
+        Optionally specify a custom growth rate as a percent.
     start_date : Optional[str]
         Start date of the stock data, format YYYY-MM-DD
     source_earnings : str
@@ -70,7 +73,7 @@ def display_peg_line(
     Examples
     --------
     >>> from openbb_terminal.sdk import openbb
-    >>> openbb.stocks.fa.peg_chart(symbol="AAPL")
+    >>> openbb.stocks.fa.peg_chart(symbol="BABA", currency="USD", growth_rate=22)
 
     Notes
     -----
@@ -90,6 +93,7 @@ def display_peg_line(
     peg_est_col = "Forecast at P/E=G"
     peg_low_col = "Low at P/E=G"
     peg_high_col = "High at P/E=G"
+    ror_col = "Rate of Return"
 
     fig = OpenBBFigure(yaxis_title="Price").set_title(
         f"{symbol} (Time Series) and PEG Line Forecast"
@@ -194,7 +198,7 @@ def display_peg_line(
         }
     if est_df.empty:
         console.print(f"Earnings estimates not found for symbol: {symbol}")
-        return fig.show(external=False)
+        return None
     else:
         if source_estimates == "BusinessInsider":
             est_df[est_col] = est_df[est_col].str.replace("[^.0-9]", "", regex=True) 
@@ -227,15 +231,17 @@ def display_peg_line(
     # TODO : calculate historical growth rates
 
     # calculate future growth rate
-    # TODO: consider using complex growth rate (next-last)/last.abs
-    growth_df = peg_df.loc[(peg_df.index.month == month_end) & (peg_df.index.day == day_end), :]
-    growth_df = growth_df.tail(est_df.shape[0] + 1)
-    start = growth_df[ttm_col][0]
-    end = growth_df[est_col][-1]
-    # NOTE: a P/E of 15 is considered fair even when growth is slower
-    rate = max(100 * (pow(end / start, 1 / est_df.shape[0]) - 1), 15)
+    num_years = est_df.shape[0]
+    if not growth_rate:
+        # TODO: consider using complex growth rate (next-last)/last.abs
+        growth_df = peg_df.loc[(peg_df.index.month == month_end) & (peg_df.index.day == day_end), :]
+        growth_df = growth_df.tail(num_years + 1)
+        start = growth_df[ttm_col][0]
+        end = growth_df[est_col][-1]
+        # NOTE: a P/E of 15 is considered fair even when growth is slower
+        growth_rate = max(100 * (pow(end / start, 1 / num_years) - 1), 15)
 
-    peg_df[growth_col] = rate
+    peg_df[growth_col] = growth_rate
     peg_df[peg_col] = peg_df[ttm_col] * peg_df[growth_col]
     peg_df[peg_est_col] = peg_df[est_col] * peg_df[growth_col]
     peg_df[peg_low_col] = peg_df[est_low_col] * peg_df[growth_col]
@@ -245,16 +251,21 @@ def display_peg_line(
     peg_df.at[i, peg_low_col] = peg_df.at[i, peg_col]
     peg_df.at[i, peg_high_col] = peg_df.at[i, peg_col]
 
+    # load price data
     if not data:
         if not start_date:
             start_date = eps_df[date_col].min()
         data = stocks_helper.load(symbol=symbol, start_date=start_date)
         close_col = ta_helpers.check_columns(data, False, False, True)
-    data.index.name = date_col
 
     if start_date:
         data = data[start_date:]
         peg_df = peg_df[start_date:]
+
+    # create rate of return line
+    ror_df = data.tail(1)[close_col].rename(columns={close_col: ror_col})
+    ror_df.at[peg_df.index[-1], ror_col] = peg_df[peg_est_col][-1]
+    ror = round((ror_df[ror_col][1] - ror_df[ror_col][0]) / num_years, 2)
 
     fig.add_scatter(
         x=data.index,
@@ -268,8 +279,7 @@ def display_peg_line(
         y=peg_df[peg_col].values,
         name=peg_col,
         line_width=2,
-        fill="tozeroy",
-        opacity=0.95
+        #fill="tozeroy"
     )
 
     fig.add_scatter(
@@ -277,8 +287,7 @@ def display_peg_line(
         y=peg_df[peg_est_col].values,
         name=peg_est_col,
         line_width=2,
-        #fill="tonexty",
-        #opacity=0.95
+        line_dash="dash"
     )
 
     fig.add_scatter(
@@ -286,6 +295,7 @@ def display_peg_line(
         y=peg_df[peg_low_col].values,
         name=peg_low_col,
         line_width=2,
+        line_dash="dash",
         fill="tonext",
         opacity=0.95
     )
@@ -295,8 +305,18 @@ def display_peg_line(
         y=peg_df[peg_high_col].values,
         name=peg_high_col,
         line_width=2,
+        line_dash="dash",
         fill="tonext",
         opacity=0.95
+    )
+
+    fig.add_scatter(
+        x=ror_df.index,
+        y=ror_df[ror_col].values,
+        name=f"{num_years}Y {ror_col}: {str(ror)}%",
+        line_width=2,
+        line_dash="dash",
+        line_color="white"
     )
 
     export_data(
