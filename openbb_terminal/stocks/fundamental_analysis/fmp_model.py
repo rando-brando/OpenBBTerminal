@@ -815,3 +815,40 @@ def get_filings(
         df = pd.DataFrame()
 
     return df
+
+
+@log_start_end(log=logger)
+@check_api_key(["API_KEY_FINANCIALMODELINGPREP"])
+def get_earnings_surprises(symbol: str) -> pd.DataFrame:
+    """Get earnings surprises for ticker
+
+    Parameters
+    ----------
+    symbol : str
+        Stock ticker symbol
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe of earnings
+    """
+    current_user = get_current_user()
+
+    url = (
+        f"https://financialmodelingprep.com/api/v3/earnings-surprises/{symbol}?"
+        f"apikey={current_user.credentials.API_KEY_FINANCIALMODELINGPREP}"
+    )
+    response = request(url)
+
+    # Check if response is valid
+    if response.status_code != 200 or "Error Message" in response.json():
+        message = f"Error, Status Code: {response.status_code}."
+        message = (
+            message
+            if "Error Message" not in response.json()
+            else message + "\n" + response.json()["Error Message"] + ".\n"
+        )
+        console.print(message)
+        return pd.DataFrame()
+
+    return pd.DataFrame(response.json())
