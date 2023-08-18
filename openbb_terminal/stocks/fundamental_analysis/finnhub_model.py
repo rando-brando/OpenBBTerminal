@@ -46,3 +46,38 @@ def get_rating_over_time(symbol: str) -> pd.DataFrame:
         console.print(f"Error in request: {response.json()['error']}", "\n")
 
     return df
+
+
+@log_start_end(log=logger)
+@check_api_key(["API_FINNHUB_KEY"])
+def get_earnings_surprises(symbol: str) -> pd.DataFrame:
+    """Get earnings surprises for ticker
+
+    Parameters
+    ----------
+    symbol : str
+        Stock ticker symbol
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe of earnings
+    """
+    response = request(
+        f"https://finnhub.io/api/v1/stock/earnings?symbol={symbol}&token={get_current_user().credentials.API_FINNHUB_KEY}"
+    )
+    df = pd.DataFrame()
+
+    if response.status_code == 200:
+        if response.json():
+            df = pd.DataFrame(response.json())
+        else:
+            console.print("No earnings data found", "\n")
+    elif response.status_code == 401:
+        console.print("[red]Invalid API Key[/red]\n")
+    elif response.status_code == 403:
+        console.print("[red]API Key not authorized for Premium Feature[/red]\n")
+    else:
+        console.print(f"Error in request: {response.json()['error']}", "\n")
+
+    return df
