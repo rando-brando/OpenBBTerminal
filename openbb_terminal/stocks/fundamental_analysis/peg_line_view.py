@@ -34,16 +34,15 @@ logger = logging.getLogger(__name__)
 def display_peg_line(
     symbol: str,
     data: Optional[pd.DataFrame] = None,
-    currency: Optional[str] = None,
-    growth_rate: Optional[str] = None,
     start_date: Optional[str] = None,
+    growth_rate: Optional[str] = None,
     source_earnings: str = "AlphaVantage",
     source_estimates: str = "SeekingAlpha",
     raw: bool = False,
     export: str = "",
     sheet_name: Optional[str] = None
 ) -> Union[OpenBBFigure, None]:
-    """Display the price to earnings growth line for a given stock. [Source: Multiple]
+    """Display the price/earnings growth line for a given stock. [Source: Multiple]
 
     Parameters
     ----------
@@ -51,12 +50,10 @@ def display_peg_line(
         Stock ticker symbol
     data: pd.DataFrame
         Stock dataframe
-    currency : Optional[str]
-        Optionally specify the currency to return results in.
-    growth_rate : Optional[str]
-        Optionally specify a custom growth rate as a percent.
     start_date : Optional[str]
         Start date of the stock data, format YYYY-MM-DD
+    growth_rate : Optional[str]
+        Optionally specify a custom growth rate as a percent.
     source_earnings : str
         The selected data provider for historical earnings.
     source_estimates: str
@@ -73,7 +70,7 @@ def display_peg_line(
     Examples
     --------
     >>> from openbb_terminal.sdk import openbb
-    >>> openbb.stocks.fa.peg_chart(symbol="BABA", currency="USD", growth_rate=22)
+    >>> openbb.stocks.fa.peg_chart(symbol="AAPL", growth_rate=22)
 
     Notes
     -----
@@ -82,6 +79,7 @@ def display_peg_line(
     - Estimated EPS [Source: SeekingAlpha, BusinessInsider, StockAnalysis]
     - Forex Rates [Source: YahooFinance]
     """
+    title = f"{symbol} Price/Earnings Growth Forecast"
     date_col = "Date"
     eps_col = "Actual EPS"
     est_col = "Estimated EPS"
@@ -95,23 +93,23 @@ def display_peg_line(
     peg_high_col = "High at P/E=G"
     ror_col = "Rate of Return"
 
-    fig = OpenBBFigure(yaxis_title="Price").set_title(
-        f"{symbol} (Time Series) and PEG Line Forecast"
-    )
-
-    reported_currency = yahoo_finance_model.get_currency(symbol)
-    if len(reported_currency) != 3:
-        console.print(f"Warning: Unable to identify the currency unit. Assuming USD.")
-        reported_currency = "USD"
-    requested_currency = currency if currency else reported_currency
-
     overview = av_model.get_overview(symbol)
+    if overview.empty:
+        return None
+    currency = overview.loc["Currency"][0]
     div_yield = overview.loc["DividendYield"][0]
     year_end = overview.loc["FiscalYearEnd"][0]
     temp_date = pd.to_datetime(year_end, format="%B")
     month_end = temp_date.month
     day_end = (temp_date + pd.offsets.MonthEnd(0)).day
     last_qtr = overview.loc["LatestQuarter"][0]
+
+    reported_currency = yahoo_finance_model.get_currency(symbol)
+    if len(reported_currency) != 3:
+        console.print(f"Unable to identify the currency unit. Assuming USD\n.")
+        reported_currency = "USD"
+
+    fig = OpenBBFigure(title=title, yaxis_title=f"Price ({reported_currency})")
 
     # prep historical eps
     eps_df = pd.DataFrame()
@@ -136,12 +134,11 @@ def display_peg_line(
             "estimate": est_col
         }
     if eps_df.empty:
-        console.print(f"Earnings history not found for symbol: {symbol}")
         return None
     else:
         eps_df = eps_df.rename(columns=renames)
         # NOTE: fixes date alignment (first row is latest and updates backward)
-        # TODO: identify freq for the rare cases eps is not reported quarterly
+        # TODO: override freq for the rare cases eps is not reported quarterly
         eps_df[date_col] = pd.date_range(last_qtr, periods=eps_df.shape[0], freq="-3M")
         eps_df[date_col] = eps_df[date_col].astype("str")
         eps_df = eps_df.loc[::-1, [date_col, eps_col, est_col]]
@@ -151,20 +148,22 @@ def display_peg_line(
         eps_df = eps_df.loc[:, [date_col, ttm_col]]
 
     # convert historical eps currency
-    if requested_currency != reported_currency:
-        start_date = eps_df[date_col].min()
+    if currency != reported_currency:
+        if not start_date:
+            start_date = eps_df[date_col].min()
         rates_df = forex_helper.load(
-            to_symbol=requested_currency,
+            to_symbol=currency,
             from_symbol=reported_currency,
             start_date=start_date,
             interval="1mo"
         )
         rates_df.index.name = date_col
         rates_df.index = rates_df.index + pd.offsets.MonthEnd(0)
+        rates_df.index = rates_df.index.astype("str")
         rates_df = rates_df.drop_duplicates().loc[:, "Close"]
         eps_df = eps_df.merge(rates_df, how="left", on="Date")
-        eps_df[eps_col] = eps_df[eps_col] * eps_df["Close"]
-        eps_df[est_col] = eps_df[est_col] * eps_df["Close"]
+        #eps_df[eps_col] = eps_df[eps_col] * eps_df["Close"]
+        #eps_df[est_col] = eps_df[est_col] * eps_df["Close"]
         eps_df[ttm_col] = eps_df[ttm_col] * eps_df["Close"]
         eps_df.drop(columns="Close", inplace=True)
 
@@ -184,11 +183,11 @@ def display_peg_line(
             "fiscalyear": date_col,
             "actual": eps_col,
             "consensus_mean": est_col,
-            "consensus_low": est_high_col,
-            "consensus_high": est_low_col
+            "consensus_low": est_low_col,
+            "consensus_high": est_high_col
         }
     elif source_estimates == "StockAnalysis":
-        est_df = stock_analysis_model.get_estimates(symbol)
+        est_df = stock_analysis_model.get_eps_forecast(symbol)
         est_df = est_df.transpose().drop("EPS", axis=0).reset_index()
         renames = {
             "index": date_col,
@@ -197,7 +196,6 @@ def display_peg_line(
             2: est_low_col
         }
     if est_df.empty:
-        console.print(f"Earnings estimates not found for symbol: {symbol}")
         return None
     else:
         if source_estimates == "BusinessInsider":
@@ -215,8 +213,8 @@ def display_peg_line(
         # NOTE: these estimates are always provided in USD
         if source_estimates in ["BusinessInsider", "Seeking Alpha"]:
             reported_currency = "USD"
-        if requested_currency != reported_currency:
-            est_df["Close"] = sdk_helpers.quote(f"USD{requested_currency}").loc["Quote", 0]
+        if currency != reported_currency:
+            est_df["Close"] = sdk_helpers.quote(f"{reported_currency}USD").loc["Quote", 0]
             est_df[est_col] = est_df[est_col] * est_df["Close"]
             est_df[est_low_col] = est_df[est_low_col] * est_df["Close"]
             est_df[est_high_col] = est_df[est_high_col] * est_df["Close"]
@@ -238,10 +236,11 @@ def display_peg_line(
         growth_df = growth_df.tail(num_years + 1)
         start = growth_df[ttm_col][0]
         end = growth_df[est_col][-1]
+        growth_rate = round(100 * (pow(end / start, 1 / num_years) - 1), 2)
         # NOTE: a P/E of 15 is considered fair even when growth is slower
-        growth_rate = max(100 * (pow(end / start, 1 / num_years) - 1), 15)
+    rate = max(growth_rate, 15)
 
-    peg_df[growth_col] = growth_rate
+    peg_df[growth_col] = rate
     peg_df[peg_col] = peg_df[ttm_col] * peg_df[growth_col]
     peg_df[peg_est_col] = peg_df[est_col] * peg_df[growth_col]
     peg_df[peg_low_col] = peg_df[est_low_col] * peg_df[growth_col]
@@ -263,23 +262,17 @@ def display_peg_line(
         peg_df = peg_df[start_date:]
 
     # create rate of return line
-    ror_df = data.tail(1)[close_col].rename(columns={close_col: ror_col})
+    ror_df = pd.DataFrame(data.tail(1)[close_col]).rename(columns={close_col: ror_col})
     ror_df.at[peg_df.index[-1], ror_col] = peg_df[peg_est_col][-1]
-    ror = round((ror_df[ror_col][1] - ror_df[ror_col][0]) / num_years, 2)
-
-    fig.add_scatter(
-        x=data.index,
-        y=data[close_col].values,
-        name="Close",
-        line_width=2,
-    )
+    ror = round(100 * (pow(ror_df[ror_col][1] / ror_df[ror_col][0], 1 / num_years) - 1), 2)
 
     fig.add_scatter(
         x=peg_df.index,
         y=peg_df[peg_col].values,
         name=peg_col,
         line_width=2,
-        #fill="tozeroy"
+        line_color="#ef7d00",
+        fill="tozeroy"
     )
 
     fig.add_scatter(
@@ -287,7 +280,19 @@ def display_peg_line(
         y=peg_df[peg_est_col].values,
         name=peg_est_col,
         line_width=2,
-        line_dash="dash"
+        line_color="#9b30d9",
+        line_dash="dash",
+        fill="tozeroy"
+    )    
+
+    fig.add_scatter(
+        x=peg_df.index,
+        y=peg_df[peg_high_col].values,
+        name=peg_high_col,
+        line_width=2,
+        line_color="#5f00af",
+        line_dash="dash",
+        fill="tonexty"
     )
 
     fig.add_scatter(
@@ -295,28 +300,38 @@ def display_peg_line(
         y=peg_df[peg_low_col].values,
         name=peg_low_col,
         line_width=2,
-        line_dash="dash",
-        fill="tonext",
-        opacity=0.95
+        line_color="#af87ff",
+        line_dash="dash"
     )
 
     fig.add_scatter(
-        x=peg_df.index,
-        y=peg_df[peg_high_col].values,
-        name=peg_high_col,
+        x=data.index,
+        y=data[close_col].values,
+        name="Close",
         line_width=2,
-        line_dash="dash",
-        fill="tonext",
-        opacity=0.95
+        line_color="#ffed00"
     )
 
     fig.add_scatter(
         x=ror_df.index,
         y=ror_df[ror_col].values,
-        name=f"{num_years}Y {ror_col}: {str(ror)}%",
+        name=f"Annual {ror_col}: {str(ror)}%",
         line_width=2,
-        line_dash="dash",
-        line_color="white"
+        line_color="white",
+        line_dash="dash"
+    )
+
+    fig.add_annotation(
+        text=f"Estimated Annual Growth (G): {growth_rate}%",
+        font_color="white",
+        showarrow=False,
+        xanchor="center",
+        yanchor="top",
+        xref="paper",
+        yref="paper",
+        y=1,
+        bordercolor="white",
+        borderwidth=1
     )
 
     export_data(
@@ -332,7 +347,7 @@ def display_peg_line(
         peg_df.index = peg_df.index.date
         return print_rich_table(
             peg_df,
-            title=f"{symbol} (Time Series) and PEG Line Forecast",
+            title=title,
             headers=list(peg_df.columns),
             show_index=True,
             export=bool(export)
