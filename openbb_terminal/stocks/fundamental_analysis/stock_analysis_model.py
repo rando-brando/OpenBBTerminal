@@ -64,6 +64,9 @@ def _get_forecast_table(symbol: str, table: str) -> pd.DataFrame:
         df = pd.read_html(str(data[2]))[0]
     elif table == "EPS Growth":
         df = pd.read_html(str(data[3]))[0]
+    colnames = df.iloc[:, 0].values
+    df = df.iloc[:, 1:].transpose()
+    df.columns = colnames
 
     return df
 
