@@ -5,14 +5,15 @@ import logging
 import os
 from typing import Optional, Union
 import pandas as pd
+import yfinance as yf
 
 from openbb_terminal import OpenBBFigure, theme
+from openbb_terminal.rich_config import console
 from openbb_terminal.decorators import log_start_end
 from openbb_terminal.helper_funcs import (
     export_data,
     print_rich_table,
 )
-from openbb_terminal.rich_config import console
 
 from openbb_terminal.stocks import stocks_helper
 from openbb_terminal.forex import forex_helper
@@ -25,7 +26,6 @@ from openbb_terminal.stocks.fundamental_analysis import finnhub_model
 from openbb_terminal.stocks.fundamental_analysis import fmp_model
 from openbb_terminal.stocks.fundamental_analysis import seeking_alpha_model
 from openbb_terminal.stocks.fundamental_analysis import stock_analysis_model
-from openbb_terminal.stocks.fundamental_analysis import yahoo_finance_model
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ def display_peg_line(
     -----
     The model offers the following data source provider options:
     - Historical EPS [Source: AlphaVantage, FinancialModelingPrep, Finnhub]
-    - Estimated EPS [Source: SeekingAlpha, BusinessInsider, StockAnalysis]
+    - Estimated EPS [Source: SeekingAlpha, BusinessInsider, Finnhub, StockAnalysis]
     - Forex Rates [Source: YahooFinance]
     """
     title = f"{symbol} Price/Earnings Growth Forecast"
@@ -93,21 +93,35 @@ def display_peg_line(
     peg_high_col = "High at P/E=G"
     ror_col = "Rate of Return"
 
-    overview = av_model.get_overview(symbol)
-    if overview.empty:
-        return None
-    currency = overview.loc["Currency"][0]
-    div_yield = overview.loc["DividendYield"][0]
-    year_end = overview.loc["FiscalYearEnd"][0]
-    temp_date = pd.to_datetime(year_end, format="%B")
-    month_end = temp_date.month
-    day_end = (temp_date + pd.offsets.MonthEnd(0)).day
-    last_qtr = overview.loc["LatestQuarter"][0]
-
-    reported_currency = yahoo_finance_model.get_currency(symbol)
-    if len(reported_currency) != 3:
-        console.print(f"Unable to identify the currency unit. Assuming USD\n.")
-        reported_currency = "USD"
+    # NOTE: Get required inputs from free provider to avoid wasteful API calls.
+    try:
+        stock = yf.Ticker(symbol)
+        currency = stock.basic_info["currency"]
+        reported_currency = stock.info["financialCurrency"]
+        last_qtr = pd.to_datetime(stock.info["mostRecentQuarter"], unit="s")
+        year_end = pd.to_datetime(stock.info["nextFiscalYearEnd"], unit="s")
+        month_end = year_end.month
+        day_end = year_end.day
+    # NOTE: Fallback on premium endpoints if free provider stops working.
+    except Exception:
+        overview = av_model.get_overview(symbol)
+        last_qtr = overview.loc["LatestQuarter"][0]
+        temp_date = pd.to_datetime(overview.loc["FiscalYearEnd"][0], format="%B")
+        month_end = temp_date.month
+        day_end = (temp_date + pd.offsets.MonthEnd(0)).day
+        if source_earnings == "AlphaVantage":
+            income = av_model.get_income_statements(symbol, quarterly=True)
+            currency = overview.loc["Currency"][0]
+            reported_currency = income.loc["reportedCurrency"][0]
+        elif source_earnings == "FinancialModelingPrep":
+            overview = fmp_model.get_profile(symbol)
+            income = fmp_model.get_income(symbol)
+            currency = overview.loc["currency"][0]
+            reported_currency = income.loc["Reported currency"][0]
+        elif source_earnings == "Finnhub":
+            overview = finnhub_model.get_profile2(symbol)
+            currency = overview.loc["Currency"][0]
+            reported_currency = overview.loc["estimateCurrency"][0]
 
     fig = OpenBBFigure(title=title, yaxis_title=f"Price ({reported_currency})")
 
@@ -127,14 +141,13 @@ def display_peg_line(
             "estimatedEarning": est_col
         }
     elif source_earnings == "Finnhub":
-        eps_df = finnhub_model.get_earnings_surprises(symbol)
+        eps_df = finnhub_model.get_earnings(symbol, quarterly=True)
         renames = {
             "period": date_col,
-            "actual": eps_col,
-            "estimate": est_col
+            "v": eps_col
         }
     if eps_df.empty:
-        return None
+        return fig
     else:
         eps_df = eps_df.rename(columns=renames)
         # NOTE: fixes date alignment (first row is latest and updates backward)
@@ -162,13 +175,10 @@ def display_peg_line(
         rates_df.index = rates_df.index.astype("str")
         rates_df = rates_df.drop_duplicates().loc[:, "Close"]
         eps_df = eps_df.merge(rates_df, how="left", on="Date")
-        #eps_df[eps_col] = eps_df[eps_col] * eps_df["Close"]
-        #eps_df[est_col] = eps_df[est_col] * eps_df["Close"]
         eps_df[ttm_col] = eps_df[ttm_col] * eps_df["Close"]
         eps_df.drop(columns="Close", inplace=True)
 
     # prep estimated eps
-    est_df = pd.DataFrame()
     if source_estimates == "BusinessInsider":
         est_df = business_insider_model.get_estimates(symbol)[0]
         est_df.index.name = None
@@ -176,6 +186,14 @@ def display_peg_line(
         renames = {
             "index": date_col,
             "EPS": est_col
+        }
+    elif source_estimates == "Finnhub":
+        est_df = finnhub_model.get_estimates(symbol, quarterly=True)
+        renames = {
+            "period": date_col,
+            "epsAvg": est_col,
+            "epsLow": est_low_col,
+            "epsHigh": est_high_col
         }
     elif source_estimates == "SeekingAlpha":
         est_df = seeking_alpha_model.get_estimates_eps(symbol)
@@ -188,7 +206,6 @@ def display_peg_line(
         }
     elif source_estimates == "StockAnalysis":
         est_df = stock_analysis_model.get_eps_forecast(symbol)
-        est_df = est_df.transpose().drop("EPS", axis=0).reset_index()
         renames = {
             "index": date_col,
             0: est_high_col,
@@ -196,29 +213,31 @@ def display_peg_line(
             2: est_low_col
         }
     if est_df.empty:
-        return None
+        return fig
     else:
-        if source_estimates == "BusinessInsider":
-            est_df[est_col] = est_df[est_col].str.replace("[^.0-9]", "", regex=True) 
-            est_df = est_df[est_df[date_col].notna()]
-            est_df[est_low_col] = pd.to_numeric(None)
-            est_df[est_high_col] = pd.to_numeric(None)
-        if source_estimates == "SeekingAlpha":
-            est_df = est_df[est_df["actual"] == 0].head(5)
         est_df = est_df.rename(columns=renames)
-        est_df[date_col] = est_df[date_col].astype("str") + f"-{month_end}-{day_end}"
-        est_df = est_df.loc[:, [date_col, est_col, est_low_col, est_high_col]]
+        est_df = est_df[est_df[date_col].notna()]
+        if est_df[date_col].dtype == "int" or len(est_df[date_col][0]) == 4:
+            est_df[date_col] = est_df[date_col].astype("str") + f"-{month_end}-{day_end}"
+        if eps_col in est_df.columns:
+            est_df = est_df[(est_df[eps_col] == 0) | est_df[eps_col].isna()]
+        for col in [est_col, est_low_col, est_high_col]:
+            if col not in est_df.columns:
+                est_df[col] = pd.to_numeric(None)
+            if est_df[col].dtype != "float":
+                est_df[col] = est_df[col].str.replace("[^.0-9]", "", regex=True)
+        est_df = est_df.loc[:, [date_col, est_col, est_low_col, est_high_col]].head(5)
 
-        # convert estimated eps currency
-        # NOTE: these estimates are always provided in USD
-        if source_estimates in ["BusinessInsider", "Seeking Alpha"]:
-            reported_currency = "USD"
-        if currency != reported_currency:
-            est_df["Close"] = sdk_helpers.quote(f"{reported_currency}USD").loc["Quote", 0]
-            est_df[est_col] = est_df[est_col] * est_df["Close"]
-            est_df[est_low_col] = est_df[est_low_col] * est_df["Close"]
-            est_df[est_high_col] = est_df[est_high_col] * est_df["Close"]
-            est_df.drop(columns="Close", inplace=True)
+    # convert estimated eps currency
+    # NOTE: these estimates are always provided in USD
+    if source_estimates in ["BusinessInsider", "Seeking Alpha"]:
+        reported_currency = "USD"
+    if currency != reported_currency:
+        est_df["Close"] = sdk_helpers.quote(f"{reported_currency}USD").loc["Quote", 0]
+        est_df[est_col] = est_df[est_col] * est_df["Close"]
+        est_df[est_low_col] = est_df[est_low_col] * est_df["Close"]
+        est_df[est_high_col] = est_df[est_high_col] * est_df["Close"]
+        est_df.drop(columns="Close", inplace=True)
 
     # join earnings and estimates
     peg_df = pd.concat([eps_df, est_df], ignore_index=True)
@@ -240,6 +259,7 @@ def display_peg_line(
         # NOTE: a P/E of 15 is considered fair even when growth is slower
     rate = max(growth_rate, 15)
 
+    # calculate PEG line
     peg_df[growth_col] = rate
     peg_df[peg_col] = peg_df[ttm_col] * peg_df[growth_col]
     peg_df[peg_est_col] = peg_df[est_col] * peg_df[growth_col]
