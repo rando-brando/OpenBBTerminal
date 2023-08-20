@@ -28,8 +28,9 @@ def get_rating_over_time(symbol: str) -> pd.DataFrame:
     pd.DataFrame
         Get dataframe with ratings
     """
+    token = get_current_user().credentials.API_FINNHUB_KEY
     response = request(
-        f"https://finnhub.io/api/v1/stock/recommendation?symbol={symbol}&token={get_current_user().credentials.API_FINNHUB_KEY}"
+        f"https://finnhub.io/api/v1/stock/recommendation?symbol={symbol}&token={token}"
     )
     df = pd.DataFrame()
 
@@ -63,8 +64,9 @@ def get_earnings_surprises(symbol: str) -> pd.DataFrame:
     pd.DataFrame
         Dataframe of earnings
     """
+    token = get_current_user().credentials.API_FINNHUB_KEY
     response = request(
-        f"https://finnhub.io/api/v1/stock/earnings?symbol={symbol}&token={get_current_user().credentials.API_FINNHUB_KEY}"
+        f"https://finnhub.io/api/v1/stock/earnings?symbol={symbol}&token={token}"
     )
     df = pd.DataFrame()
 
