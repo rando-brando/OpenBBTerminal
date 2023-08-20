@@ -180,7 +180,7 @@ def display_peg_line(
     # calculate historical growth rates
     prior = eps_df[ttm_col].shift(1)
     eps_df[growth_col] = 100 * (eps_df[ttm_col] - prior) / prior.abs()
-    eps_df[growth_col] = eps_df[growth_col].apply(lambda x: max(x, 15)).round(2)
+    eps_df[growth_col] = eps_df[growth_col].apply(lambda x: min(100, max(x, 15))).round(2)
 
     # prep estimated eps
     if source_estimates == "BusinessInsider":
