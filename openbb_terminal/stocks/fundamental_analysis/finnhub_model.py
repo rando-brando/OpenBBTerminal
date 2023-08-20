@@ -161,3 +161,43 @@ def get_earnings(symbol: str, quarterly: bool = False) -> pd.DataFrame:
         console.print(f"Error in request: {response.json()['error']}", "\n")
 
     return df
+
+
+@log_start_end(log=logger)
+@check_api_key(["API_FINNHUB_KEY"])
+def get_estimates(symbol: str, quarterly: bool = False) -> pd.DataFrame:
+    """Get earnings estimates for ticker
+
+    Parameters
+    ----------
+    symbol : str
+        Stock ticker symbol
+    quarterly : bool, optional
+        Flag to get quarterly and not annual, by default False
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe of earnings estimates
+    """
+    token = get_current_user().credentials.API_FINNHUB_KEY
+    if quarterly:
+        url = f"https://finnhub.io/api/v1/stock/eps-estimates?symbol={symbol}&freq=quarterly&token={token}"
+    else:
+        url = f"https://finnhub.io/api/v1/stock/eps-estimates?symbol={symbol}&token={token}"
+    response = request(url)
+    df = pd.DataFrame()
+
+    if response.status_code == 200:
+        if response.json():
+            df = pd.DataFrame(response.json()["data"])
+        else:
+            console.print("No earnings data found", "\n")
+    elif response.status_code == 401:
+        console.print("[red]Invalid API Key[/red]\n")
+    elif response.status_code == 403:
+        console.print("[red]API Key not authorized for Premium Feature[/red]\n")
+    else:
+        console.print(f"Error in request: {response.json()['error']}", "\n")
+
+    return df
