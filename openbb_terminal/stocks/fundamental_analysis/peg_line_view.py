@@ -86,6 +86,7 @@ def display_peg_line(
     est_low_col = "Estimated Low"
     est_high_col = "Estimated High"
     ttm_col = "TTM EPS"
+    smooth_col = "Smooth EPS"
     growth_col = "Growth Rate"
     peg_col = "Price at P/E=G"
     peg_est_col = "Forecast at P/E=G"
@@ -178,9 +179,12 @@ def display_peg_line(
         eps_df.drop(columns="Close", inplace=True)
 
     # calculate historical growth rates
-    prior = eps_df[ttm_col].shift(1)
-    eps_df[growth_col] = 100 * (eps_df[ttm_col] - prior) / prior.abs()
-    eps_df[growth_col] = eps_df[growth_col].apply(lambda x: min(100, max(x, 15))).round(2)
+    eps_df[smooth_col] = eps_df[ttm_col].mask(eps_df[ttm_col] < 0.01, 0.01).ewm(span=20).mean()
+    eps_df[ttm_col] = eps_df[ttm_col].mask(eps_df[ttm_col] < 0, 0)
+    eps_df[growth_col] = (eps_df[smooth_col] / eps_df[smooth_col].shift(40)).pow(0.1) - 1
+    eps_df[growth_col] = eps_df[growth_col].mask(eps_df[growth_col] < 0.15, 0.15)
+    eps_df[growth_col] = eps_df[growth_col].bfill()
+    eps_df[growth_col] = 100 * eps_df[growth_col].round(4)
 
     # prep estimated eps
     if source_estimates == "BusinessInsider":
@@ -232,6 +236,7 @@ def display_peg_line(
             if est_df[col].dtype != "float":
                 est_df[col] = est_df[col].str.replace("[^.0-9]", "", regex=True)
                 est_df[col] = pd.to_numeric(est_df[col], errors="coerce")
+            est_df[col] = est_df[col].mask(est_df[col] < 0.01, 0.01)
         est_df = est_df.loc[:, [date_col, est_col, est_low_col, est_high_col]].head(5)
 
     # convert estimated eps currency
@@ -250,21 +255,21 @@ def display_peg_line(
     if not growth_rate:
         dates = pd.to_datetime(eps_df[date_col])
         year_end = (dates.dt.month == month_end) & (dates.dt.day == day_end)
-        start = eps_df.loc[year_end, ttm_col].iloc[-1]
-        end = est_df[est_col].iloc[-1]
-        growth_rate = 100 * (pow(end / start, 1 / num_years) - 1)
-    growth_rate = round(max(growth_rate, 15), 2)
-    est_df[growth_col] = growth_rate
+        estimates = eps_df.loc[year_end, ttm_col].tail(1).append(est_df[est_col])
+        estimates = (estimates - estimates.shift(1)) / estimates.shift(1).abs()
+        growth_rate = round(100 * estimates[::-1].ewm(span=5).mean().iloc[-1], 2)
+    fair_rate = max(growth_rate, 15)
+    est_df[growth_col] = fair_rate
 
     # calculate PEG line
     peg_df = pd.concat([eps_df, est_df], ignore_index=True)
     peg_df.drop_duplicates(subset="Date", inplace=True)
     peg_df[date_col] = pd.to_datetime(peg_df[date_col])
     peg_df.set_index("Date", inplace=True)
-    peg_df[peg_col] = peg_df[ttm_col].apply(lambda x: max(x, 0)) * peg_df[growth_col]
-    peg_df[peg_est_col] = peg_df[est_col].apply(lambda x: max(x, 0)) * peg_df[growth_col]
-    peg_df[peg_low_col] = peg_df[est_low_col].apply(lambda x: max(x, 0)) * peg_df[growth_col]
-    peg_df[peg_high_col] = peg_df[est_high_col].apply(lambda x: max(x, 0)) * peg_df[growth_col]
+    peg_df[peg_col] = peg_df[ttm_col] * peg_df[growth_col]
+    peg_df[peg_est_col] = peg_df[est_col] * peg_df[growth_col]
+    peg_df[peg_low_col] = peg_df[est_low_col] * peg_df[growth_col]
+    peg_df[peg_high_col] = peg_df[est_high_col] * peg_df[growth_col]
     i = peg_df.index[eps_df.shape[0] - 1]
     peg_df.at[i, peg_est_col] = peg_df.at[i, peg_col]
     peg_df.at[i, peg_low_col] = peg_df.at[i, peg_col]
