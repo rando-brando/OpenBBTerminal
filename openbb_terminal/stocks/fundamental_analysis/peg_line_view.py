@@ -85,22 +85,37 @@ def display_peg_line(
     est_col = "Estimated EPS"
     est_low_col = "Estimated Low"
     est_high_col = "Estimated High"
+    dividend_col = "Dividends"
     ttm_col = "TTM EPS"
     smooth_col = "Smooth EPS"
     growth_col = "Growth Rate"
+    pe_col = "P/E Ratio"
+    norm_col = "Price at 5YMA P/E"
     peg_col = "Price at P/E=G"
     peg_est_col = "Forecast at P/E=G"
     peg_low_col = "Low at P/E=G"
     peg_high_col = "High at P/E=G"
     ror_col = "Rate of Return"
 
-    # Get required inputs from free provider to avoid wasteful API calls.
+    # prep price data
+    today = pd.to_datetime("today")
+    if not start_date:
+        start_date = today.replace(year=today.year-20).strftime("%Y-%m-01")
+    if not data:
+        data = stocks_helper.load(symbol=symbol, start_date=start_date)
+    if dividend_col not in data.columns:
+        data[dividend_col] = 0
+    close_col = ta_helpers.check_columns(data, high=False, low=False, close=True)
+    data.index.name = date_col
+
     # NOTE: These inputs ensure that the data are aligned correctly.
+    # Get required inputs from free provider to avoid wasteful API calls.
     try:
         stock = yf.Ticker(symbol)
         currency = stock.fast_info["currency"]
         reported_currency = stock.info["financialCurrency"]
-        dates = stock.get_income_stmt(freq="quarterly").columns
+        income = stock.get_income_stmt(freq="quarterly")
+        dates = income.columns
         last_qtr = dates.max()
         year_end = dates[dates.month == dates.month.max()].max()
         month_end = year_end.month
@@ -108,6 +123,8 @@ def display_peg_line(
     # Fallback on premium endpoints if free provider stops working.
     except Exception:
         overview = av_model.get_overview(symbol)
+        if overview.empty:
+            return None
         last_qtr = overview.loc["LatestQuarter"][0]
         temp_date = pd.to_datetime(overview.loc["FiscalYearEnd"][0], format="%B")
         month_end = temp_date.month
@@ -150,41 +167,87 @@ def display_peg_line(
         return None
     else:
         eps_df = eps_df.rename(columns=renames)
-        # NOTE: fixes date alignment (first row is latest and updates backward)
         # TODO: override freq for the rare cases eps is not reported quarterly
         eps_df[date_col] = pd.date_range(last_qtr, periods=eps_df.shape[0], freq="-3M")
-        eps_df[date_col] = eps_df[date_col].astype("str")
         eps_df = eps_df.loc[::-1, [date_col, eps_col]]
         eps_df[eps_col] = pd.to_numeric(eps_df[eps_col], errors="coerce")
         eps_df[ttm_col] = eps_df[eps_col].rolling(4).sum()
         eps_df = eps_df[eps_df[ttm_col].notna()]
-        eps_df = eps_df.loc[:, [date_col, ttm_col]]
+        eps_df = eps_df[[date_col, ttm_col]]
 
     # convert historical eps currency
     if currency != reported_currency:
-        if not start_date:
-            start_date = eps_df[date_col].min()
         rates_df = forex_helper.load(
             to_symbol=currency,
             from_symbol=reported_currency,
-            start_date=start_date,
+            start_date=eps_df[date_col].min().stftime("%Y-%m-01"),
             interval="1mo"
         )
         rates_df.index.name = date_col
         rates_df.index = rates_df.index + pd.offsets.MonthEnd(0)
-        rates_df.index = rates_df.index.astype("str")
+        rates_df.index = rates_df.index.strftime("%Y-%m-%d")
         rates_df = rates_df.drop_duplicates().loc[:, "Close"]
-        eps_df = eps_df.merge(rates_df, how="left", on="Date")
+        eps_df = eps_df.merge(rates_df, how="left", on=date_col)
         eps_df[ttm_col] = eps_df[ttm_col] * eps_df["Close"]
         eps_df.drop(columns="Close", inplace=True)
 
     # calculate historical growth rates
-    eps_df[smooth_col] = eps_df[ttm_col].mask(eps_df[ttm_col] < 0.01, 0.01).ewm(span=20).mean()
+    num_years = int(eps_df.shape[0] / 4)
+    num_qtrs = 4 * min(10, num_years) - 1
     eps_df[ttm_col] = eps_df[ttm_col].mask(eps_df[ttm_col] < 0, 0)
-    eps_df[growth_col] = (eps_df[smooth_col] / eps_df[smooth_col].shift(40)).pow(0.1) - 1
+    eps_df[smooth_col] = eps_df[ttm_col].mask(eps_df[ttm_col] < 0.01, 0.01).ewm(span=8).mean()
+    eps_df[growth_col] = (eps_df[smooth_col] / eps_df[smooth_col].shift(num_qtrs)).pow(0.1) - 1
     eps_df[growth_col] = eps_df[growth_col].mask(eps_df[growth_col] < 0.15, 0.15)
     eps_df[growth_col] = eps_df[growth_col].bfill()
     eps_df[growth_col] = 100 * eps_df[growth_col].round(4)
+
+    # calculate historical p/e ratios
+    pe_df = data.merge(eps_df, how="outer", on=date_col, sort=True)
+    pe_df.loc[pe_df[ttm_col].isna(), date_col] = pd.to_datetime("")
+    pe_df[date_col] = pe_df[date_col].bfill()
+    aggs = {close_col: "mean", ttm_col: "last", dividend_col: "sum"}
+    pe_df = pe_df.groupby(date_col).agg(aggs)
+    pe_df[pe_col] = pe_df[close_col] / pe_df[ttm_col]
+    pe_df = pe_df[[pe_col, dividend_col]]
+
+    # calculate historical peg ratios
+    peg_df = eps_df.merge(pe_df, how="left", on=date_col, sort=True)
+    peg_df[norm_col] = peg_df[ttm_col] * peg_df[pe_col].ewm(span=20).mean()
+    peg_df[norm_col] = peg_df[norm_col].round(2)
+    peg_df[peg_col] = peg_df[ttm_col] * peg_df[growth_col]
+    peg_df = peg_df.set_index(date_col).loc[::-1]
+
+    # create plot
+    fig = OpenBBFigure(title=title, yaxis_title=f"Price ({reported_currency})")
+
+    # plot historical peg line
+    fig.add_scatter(
+        x=eps_df.index,
+        y=eps_df[peg_col].values,
+        name=peg_col,
+        line_width=2,
+        line_color="#ef7d00",
+        fill="tozeroy"
+    )
+
+    # plot historical price line
+    fig.add_scatter(
+        x=data.index,
+        y=data[close_col].values,
+        name="Close",
+        line_width=2,
+        line_color="#ffed00"
+    )
+
+    # plot normal peg line
+    fig.add_scatter(
+        x=eps_df.index,
+        y=eps_df[norm_col].values,
+        name=norm_col,
+        line_width=2,
+        line_color="#00aaff",
+        line_dash="dash"
+    )
 
     # prep estimated eps
     if source_estimates == "BusinessInsider":
@@ -222,7 +285,7 @@ def display_peg_line(
             "Low": est_low_col
         }
     if est_df.empty:
-        return None
+        return fig.show(external=False)
     else:
         est_df = est_df.rename(columns=renames)
         est_df = est_df.loc[est_df[date_col].notna()]
@@ -241,7 +304,7 @@ def display_peg_line(
 
     # convert estimated eps currency
     # NOTE: these estimates are always provided in USD
-    if source_estimates in ["BusinessInsider", "Seeking Alpha"]:
+    if source_estimates in ["BusinessInsider", "SeekingAlpha"]:
         reported_currency = "USD"
     if currency != reported_currency:
         est_df["Close"] = sdk_helpers.quote(f"{reported_currency}USD").loc["Quote", 0]
@@ -255,7 +318,7 @@ def display_peg_line(
     if not growth_rate:
         dates = pd.to_datetime(eps_df[date_col])
         year_end = (dates.dt.month == month_end) & (dates.dt.day == day_end)
-        estimates = eps_df.loc[year_end, ttm_col].tail(1).append(est_df[est_col])
+        estimates = eps_df.loc[year_end, ttm_col].append(est_df[est_col])
         estimates = (estimates - estimates.shift(1)) / estimates.shift(1).abs()
         growth_rate = round(100 * estimates[::-1].ewm(span=5).mean().iloc[-1], 2)
     fair_rate = max(growth_rate, 15)
@@ -275,31 +338,12 @@ def display_peg_line(
     peg_df.at[i, peg_low_col] = peg_df.at[i, peg_col]
     peg_df.at[i, peg_high_col] = peg_df.at[i, peg_col]
 
-    # load price data
-    if not start_date:
-        start_date = peg_df.index.min()
-    if not data:
-        data = stocks_helper.load(symbol=symbol, start_date=start_date)
-    close_col = ta_helpers.check_columns(data, False, False, True)
-    data = data[start_date:]
-    peg_df = peg_df[start_date:]
-
     # create rate of return line
     ror_df = pd.DataFrame(data.tail(1)[close_col]).rename(columns={close_col: ror_col})
     ror_df.at[peg_df.index[-1], ror_col] = peg_df[peg_est_col][-1]
     ror = round(100 * (pow(ror_df[ror_col][1] / ror_df[ror_col][0], 1 / num_years) - 1), 2)
 
-    fig = OpenBBFigure(title=title, yaxis_title=f"Price ({reported_currency})")
-
-    fig.add_scatter(
-        x=peg_df.index,
-        y=peg_df[peg_col].values,
-        name=peg_col,
-        line_width=2,
-        line_color="#ef7d00",
-        fill="tozeroy"
-    )
-
+    # plot estimated peg line (avg)
     fig.add_scatter(
         x=peg_df.index,
         y=peg_df[peg_est_col].values,
@@ -310,6 +354,7 @@ def display_peg_line(
         fill="tozeroy"
     )    
 
+    # plot estimated peg line (high)
     fig.add_scatter(
         x=peg_df.index,
         y=peg_df[peg_high_col].values,
@@ -320,6 +365,7 @@ def display_peg_line(
         fill="tonexty"
     )
 
+    # plot estimated peg line (low)
     fig.add_scatter(
         x=peg_df.index,
         y=peg_df[peg_low_col].values,
@@ -329,14 +375,7 @@ def display_peg_line(
         line_dash="dash"
     )
 
-    fig.add_scatter(
-        x=data.index,
-        y=data[close_col].values,
-        name="Close",
-        line_width=2,
-        line_color="#ffed00"
-    )
-
+    # plot rate of return line
     fig.add_scatter(
         x=ror_df.index,
         y=ror_df[ror_col].values,
@@ -346,6 +385,7 @@ def display_peg_line(
         line_dash="dash"
     )
 
+    # add growth rate annotation
     fig.add_annotation(
         text=f"Estimated Annual Growth (G): {growth_rate}%",
         font_color="white",
