@@ -86,8 +86,8 @@ def display_peg_line(
     est_low_col = "Estimated Low"
     est_high_col = "Estimated High"
     dividend_col = "Dividends"
+    yield_col = "Dividend Yield"
     ttm_col = "TTM EPS"
-    smooth_col = "Smooth EPS"
     growth_col = "Growth Rate"
     pe_col = "P/E Ratio"
     norm_col = "Price at 5YMA P/E"
@@ -100,7 +100,7 @@ def display_peg_line(
     # prep price data
     today = pd.to_datetime("today")
     if not start_date:
-        start_date = today.replace(year=today.year-20).strftime("%Y-%m-01")
+        start_date = today.replace(year=today.year-30).strftime("%Y-%m-01")
     if not data:
         data = stocks_helper.load(symbol=symbol, start_date=start_date)
     if dividend_col not in data.columns:
@@ -173,19 +173,22 @@ def display_peg_line(
         eps_df[eps_col] = pd.to_numeric(eps_df[eps_col], errors="coerce")
         eps_df[ttm_col] = eps_df[eps_col].rolling(4).sum()
         eps_df = eps_df[eps_df[ttm_col].notna()]
+        eps_df[ttm_col] = eps_df[ttm_col].mask(eps_df[ttm_col].abs() < 0.01, pd.NA)
         eps_df = eps_df[[date_col, ttm_col]]
 
+    # NOTE: these earnings are always provided in USD
+    if source_earnings in ["FinancialModelingPrep"]:
+        reported_currency = "USD"
     # convert historical eps currency
     if currency != reported_currency:
         rates_df = forex_helper.load(
             to_symbol=currency,
             from_symbol=reported_currency,
-            start_date=eps_df[date_col].min().stftime("%Y-%m-01"),
+            start_date=eps_df[date_col].min().strftime("%Y-%m-01"),
             interval="1mo"
         )
         rates_df.index.name = date_col
         rates_df.index = rates_df.index + pd.offsets.MonthEnd(0)
-        rates_df.index = rates_df.index.strftime("%Y-%m-%d")
         rates_df = rates_df.drop_duplicates().loc[:, "Close"]
         eps_df = eps_df.merge(rates_df, how="left", on=date_col)
         eps_df[ttm_col] = eps_df[ttm_col] * eps_df["Close"]
@@ -193,12 +196,17 @@ def display_peg_line(
 
     # calculate historical growth rates
     num_years = int(eps_df.shape[0] / 4)
-    num_qtrs = 4 * min(10, num_years) - 1
-    eps_df[ttm_col] = eps_df[ttm_col].mask(eps_df[ttm_col] < 0, 0)
-    eps_df[smooth_col] = eps_df[ttm_col].mask(eps_df[ttm_col] < 0.01, 0.01).ewm(span=8).mean()
-    eps_df[growth_col] = (eps_df[smooth_col] / eps_df[smooth_col].shift(num_qtrs)).pow(0.1) - 1
-    eps_df[growth_col] = eps_df[growth_col].mask(eps_df[growth_col] < 0.15, 0.15)
-    eps_df[growth_col] = eps_df[growth_col].bfill()
+    rates_df = eps_df.copy()
+    for y in range(min(5, num_years), min(15, num_years) + 1):
+        initial = rates_df[ttm_col].shift(y * 4)
+        final = rates_df[ttm_col]
+        ratio = (final - initial + initial.abs()) / initial.abs()
+        rates_df[f"{y}YCAGR"] = ratio.pow(1/y).bfill() - 1
+    rates_df = rates_df.filter(regex="CAGR").iloc[:, ::-1]
+    eps_df[growth_col] = rates_df.ewm(span=rates_df.shape[1], axis=1).mean().iloc[:, -1]
+    eps_df[growth_col] = eps_df[growth_col].rolling(4).mean().shift(-1).fillna(eps_df[growth_col])
+    eps_df[growth_col] = eps_df[growth_col].apply(lambda g: min(0.15, 0.085 + 2 * g) if g < 0.15 else g)
+    eps_df[growth_col] = eps_df[growth_col].mask(eps_df[growth_col] < 0, 0)
     eps_df[growth_col] = 100 * eps_df[growth_col].round(4)
 
     # calculate historical p/e ratios
@@ -208,17 +216,20 @@ def display_peg_line(
     aggs = {close_col: "mean", ttm_col: "last", dividend_col: "sum"}
     pe_df = pe_df.groupby(date_col).agg(aggs)
     pe_df[pe_col] = pe_df[close_col] / pe_df[ttm_col]
-    pe_df = pe_df[[pe_col, dividend_col]]
+    pe_df[pe_col] = pe_df[pe_col].mask(pe_df[pe_col] < 0, 0)
+    pe_df[yield_col] = pe_df[dividend_col] / pe_df[close_col]
+    pe_df = pe_df[[pe_col, dividend_col, yield_col]]
 
     # calculate historical peg ratios
-    peg_df = eps_df.merge(pe_df, how="left", on=date_col, sort=True)
-    peg_df[norm_col] = peg_df[ttm_col] * peg_df[pe_col].ewm(span=20).mean()
-    peg_df[norm_col] = peg_df[norm_col].round(2)
-    peg_df[peg_col] = peg_df[ttm_col] * peg_df[growth_col]
-    peg_df = peg_df.set_index(date_col).loc[::-1]
+    eps_df = eps_df.merge(pe_df, how="left", on=date_col, sort=True)
+    abs_ttm = eps_df[ttm_col].mask(eps_df[ttm_col] < 0, 0)
+    eps_df[peg_col] = abs_ttm * eps_df[growth_col]
+    eps_df[norm_col] = abs_ttm * eps_df[pe_col].ewm(span=20).mean()
+    eps_df[norm_col] = eps_df[norm_col].round(2)
+    eps_df = eps_df.set_index(date_col).loc[::-1]
 
     # create plot
-    fig = OpenBBFigure(title=title, yaxis_title=f"Price ({reported_currency})")
+    fig = OpenBBFigure(title=title, yaxis_title=f"Price ({currency})")
 
     # plot historical peg line
     fig.add_scatter(
@@ -302,10 +313,10 @@ def display_peg_line(
             est_df[col] = est_df[col].mask(est_df[col] < 0.01, 0.01)
         est_df = est_df.loc[:, [date_col, est_col, est_low_col, est_high_col]].head(5)
 
-    # convert estimated eps currency
     # NOTE: these estimates are always provided in USD
     if source_estimates in ["BusinessInsider", "SeekingAlpha"]:
         reported_currency = "USD"
+    # convert estimated eps currency
     if currency != reported_currency:
         est_df["Close"] = sdk_helpers.quote(f"{reported_currency}USD").loc["Quote", 0]
         est_df[est_col] = est_df[est_col] * est_df["Close"]
